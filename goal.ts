@@ -131,6 +131,8 @@ function buildConversationText(messages: AgentMessage[]): string {
 interface EvalResult {
 	met: boolean;
 	reason: string;
+	/** True when no verdict could be obtained (launch failure, timeout, unclear output). */
+	failed?: boolean;
 }
 
 /** Run a fast evaluator model (spawns `pi -p` subprocess). */
@@ -161,19 +163,27 @@ async function evaluateGoal(
 	const result = await runPiSubprocess(evalPrompt, goal.evaluatorModel, ctx.cwd, 15000);
 
 	if (result.exitCode !== 0) {
-		return { met: false, reason: `Evaluator error: ${(result.stderr || "(no stderr)").slice(0, 200)}` };
+		return {
+			met: false,
+			failed: true,
+			reason: `Evaluator error: ${(result.stderr || "(no stderr)").slice(0, 200)}`,
+		};
 	}
 
-	const output = result.stdout.trim();
+	return parseEvaluatorOutput(result.stdout);
+}
 
-	// Parse structured response
-	const metMatch = output.match(/^MET:\s*(.*)/is);
+/** Parse the evaluator's one-line verdict. Unparseable output is a failure, not a verdict. */
+export function parseEvaluatorOutput(output: string): EvalResult {
+	const trimmed = output.trim();
+	const metMatch = trimmed.match(/^MET:\s*(.*)/is);
 	if (metMatch) return { met: true, reason: metMatch[1].trim() };
-	const notMetMatch = output.match(/^NOT MET:\s*(.*)/is);
+	const notMetMatch = trimmed.match(/^NOT MET:\s*(.*)/is);
 	if (notMetMatch) return { met: false, reason: notMetMatch[1].trim() };
 
-	// Fallback
-	return { met: false, reason: `Evaluator returned unclear response, assuming not yet met.` };
+	// No parseable verdict: treat as an evaluator failure so the goal pauses
+	// instead of steering forever.
+	return { met: false, failed: true, reason: "Evaluator returned no parseable MET/NOT MET verdict." };
 }
 
 /** Fallback heuristic evaluator when model-based evaluation is not available. */
@@ -207,6 +217,24 @@ interface SubprocessResult {
 	stderr: string;
 }
 
+/** Build the evaluator CLI invocation. Keep this flag list in sync with `pi --help`. */
+export function buildEvaluatorInvocation(
+	currentScript: string | undefined,
+	model: string,
+	prompt: string,
+): { command: string; args: string[] } {
+	const isBunVirtual = currentScript?.startsWith("/$bunfs/root/");
+	const useScript = Boolean(currentScript) && !isBunVirtual;
+	const command = useScript ? process.execPath : "pi";
+	const args = useScript
+		? [currentScript as string, "--mode", "json", "-p", "--no-session"]
+		: ["--mode", "json", "-p", "--no-session"];
+
+	if (model) args.push("--model", model);
+	args.push(prompt);
+	return { command, args };
+}
+
 function runPiSubprocess(
 	prompt: string,
 	model: string,
@@ -214,22 +242,7 @@ function runPiSubprocess(
 	timeoutMs: number,
 ): Promise<SubprocessResult> {
 	return new Promise((resolve) => {
-		const currentScript = process.argv[1];
-		const isBunVirtual = currentScript?.startsWith("/$bunfs/root/");
-
-		let command: string;
-		let args: string[];
-
-		if (currentScript && !isBunVirtual) {
-			command = process.execPath;
-			args = [currentScript, "--mode", "json", "-p", "--no-session", "-b"];
-		} else {
-			command = "pi";
-			args = ["--mode", "json", "-p", "--no-session", "-b"];
-		}
-
-		if (model) args.push("--model", model);
-		args.push(prompt);
+		const { command, args } = buildEvaluatorInvocation(process.argv[1], model, prompt);
 
 		const proc = spawn(command, args, {
 			cwd,
@@ -264,7 +277,9 @@ function runPiSubprocess(
 		proc.stdout.on("data", handleData);
 		proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
 
+		let timedOut = false;
 		const timer = setTimeout(() => {
+			timedOut = true;
 			proc.kill("SIGTERM");
 			setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 2000);
 		}, timeoutMs);
@@ -283,7 +298,11 @@ function runPiSubprocess(
 					if (buffer.trim()) fullText += buffer;
 				}
 			}
-			resolve({ exitCode: code ?? 0, stdout: fullText || stdout, stderr });
+			resolve({
+				exitCode: timedOut ? 124 : (code ?? 0),
+				stdout: fullText || stdout,
+				stderr: timedOut ? `Evaluator timed out after ${timeoutMs}ms` : stderr,
+			});
 		});
 
 		proc.on("error", (err) => {
@@ -495,6 +514,28 @@ export default function goalExtension(pi: ExtensionAPI) {
 			evaluation = await evaluateGoal(goal, conversationText, ctx);
 		} catch {
 			evaluation = heuristicEvaluate(goal, conversationText);
+		}
+
+		if (evaluation.failed) {
+			// Infrastructure failure, not a verdict: pause instead of re-steering.
+			ctx.ui.notify(`⚠️ Goal paused: ${evaluation.reason}`, "warning");
+			pi.sendMessage(
+				{
+					customType: "goal-evaluator-error",
+					content: [
+						`⚠️ [GOAL PAUSED — EVALUATOR ERROR]`,
+						``,
+						`Goal: ${goal.condition}`,
+						`Evaluator: ${evaluation.reason}`,
+						``,
+						`The goal has been paused instead of continuing, because no verdict could be obtained. Fix the evaluator and start the goal again, or run /goal-clear.`,
+					].join("\n"),
+					display: true,
+				},
+				{ deliverAs: "steer" },
+			);
+			clearGoal(ctx, false);
+			return;
 		}
 
 		if (evaluation.met) {

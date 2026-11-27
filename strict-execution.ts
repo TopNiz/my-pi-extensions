@@ -25,6 +25,13 @@ export default function (pi: ExtensionAPI) {
       "\"Would you like me to also do X?\"",
       "Then wait for explicit confirmation before acting.",
       "",
+      "## Date naming for files and folders",
+      "",
+      "When choosing a new dated name for a file or folder, use YYYYMMDD by default unless the user specifies a different name or naming format.",
+      "The default uses a four-digit year, a two-digit month, and a two-digit day, with no separators in the date. Put the date first, instead of a sequential folder prefix.",
+      "When copying or uploading an existing file or folder, preserve its name unless the user requests a different name or naming format.",
+      "If a date is needed and its year, month, or day is missing or unclear, ask the user before creating or renaming the item. Never guess.",
+      "",
       ].join("\n"),
     };
   });
